@@ -1,4 +1,7 @@
 #include "ldrutils.h"
+#if _M_X64
+#include "syscalls.h"
+#endif
 
 BOOL IsValidPE(
     PBYTE pbData
@@ -7,8 +10,8 @@ BOOL IsValidPE(
     PIMAGE_NT_HEADERS pNtHeaders;
 
     pNtHeaders = RVA(
-        PIMAGE_NT_HEADERS, 
-        pbData, 
+        PIMAGE_NT_HEADERS,
+        pbData,
         ((PIMAGE_DOS_HEADER)pbData)->e_lfanew
     );
 
@@ -29,14 +32,45 @@ BOOL MapSections(
     PIMAGE_BASE_RELOCATION pRelocation;
     PIMAGE_SECTION_HEADER pSectionHeader;
 
+    VIRTUALALLOC pVirtualAlloc = (VIRTUALALLOC)GetFunctionAddress(IsModulePresent(L"Kernel32.dll"), "VirtualAlloc");
+
     pNtHeaders = RVA(
-        PIMAGE_NT_HEADERS, 
-        pdModule->pbDllData, 
+        PIMAGE_NT_HEADERS,
+        pdModule->pbDllData,
         ((PIMAGE_DOS_HEADER)pdModule->pbDllData)->e_lfanew
     );
 
     // try get prefered address
-    pdModule->ModuleBase = (ULONG_PTR)VirtualAlloc(
+#if _M_X64
+    pdModule->ModuleBase = pNtHeaders->OptionalHeader.ImageBase;
+    SIZE_T RegionSize = pNtHeaders->OptionalHeader.SizeOfImage;
+    NTSTATUS status = NtAllocateVirtualMemory(
+        (HANDLE)-1,
+        (PVOID)&pdModule->ModuleBase,
+        0,
+        &RegionSize,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE
+    );
+    if (!NT_SUCCESS(status) || pdModule->ModuleBase != pNtHeaders->OptionalHeader.ImageBase)
+    {
+        pdModule->ModuleBase = 0;
+        RegionSize = pNtHeaders->OptionalHeader.SizeOfImage;
+        status = NtAllocateVirtualMemory(
+            (HANDLE)-1,
+            (PVOID)&pdModule->ModuleBase,
+            0,
+            &RegionSize,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+    }
+    if (!NT_SUCCESS(status))
+    {
+        return FALSE;
+    }
+#else
+    pdModule->ModuleBase = (ULONG_PTR)pVirtualAlloc(
         (LPVOID)(pNtHeaders->OptionalHeader.ImageBase),
         (SIZE_T)pNtHeaders->OptionalHeader.SizeOfImage,
         MEM_RESERVE | MEM_COMMIT,
@@ -45,7 +79,7 @@ BOOL MapSections(
 
     if (!pdModule->ModuleBase)
     {
-        pdModule->ModuleBase = (ULONG_PTR)VirtualAlloc(
+        pdModule->ModuleBase = (ULONG_PTR)pVirtualAlloc(
             0,
             (SIZE_T)pNtHeaders->OptionalHeader.SizeOfImage,
             MEM_RESERVE | MEM_COMMIT,
@@ -57,9 +91,9 @@ BOOL MapSections(
     {
         return FALSE;
     }
-
+#endif
     // copy across the headers
-    for (INT i = 0; i < pNtHeaders->OptionalHeader.SizeOfHeaders; i++)
+    for (DWORD i = 0; i < pNtHeaders->OptionalHeader.SizeOfHeaders; i++)
     {
         ((PBYTE)pdModule->ModuleBase)[i] = ((PBYTE)pdModule->pbDllData)[i];
     }
@@ -67,9 +101,9 @@ BOOL MapSections(
     // copy across the sections
     pSectionHeader = IMAGE_FIRST_SECTION(pNtHeaders);
 
-    for (INT i = 0; i < pNtHeaders->FileHeader.NumberOfSections; i++, pSectionHeader++)
+    for (DWORD i = 0; i < pNtHeaders->FileHeader.NumberOfSections; i++, pSectionHeader++)
     {
-        for (INT j = 0; j < pSectionHeader->SizeOfRawData; j++)
+        for (DWORD j = 0; j < pSectionHeader->SizeOfRawData; j++)
         {
             ((PBYTE)(pdModule->ModuleBase + pSectionHeader->VirtualAddress))[j] = ((PBYTE)(pdModule->pbDllData + pSectionHeader->PointerToRawData))[j];
         }
@@ -82,8 +116,8 @@ BOOL MapSections(
     if ((pdModule->ModuleBase - pNtHeaders->OptionalHeader.ImageBase) && pDataDir)
     {
         pRelocation = RVA(
-            PIMAGE_BASE_RELOCATION, 
-            pdModule->ModuleBase, 
+            PIMAGE_BASE_RELOCATION,
+            pdModule->ModuleBase,
             pDataDir->VirtualAddress
         );
 
@@ -118,6 +152,7 @@ BOOL MapSections(
 
         } while (pRelocation->VirtualAddress);
     }
+    pNtHeaders->OptionalHeader.ImageBase = pdModule->ModuleBase; // set the prefered base to the real base
 
     return TRUE;
 }
@@ -132,34 +167,26 @@ BOOL ResolveImports(
     PIMAGE_IMPORT_DESCRIPTOR pImportDesc;
     PIMAGE_DELAYLOAD_DESCRIPTOR pDelayDesc;
     PIMAGE_THUNK_DATA pFirstThunk, pOrigFirstThunk;
+    BOOL ok;
+
+    LOADLIBRARYA pLoadLibraryA = (LOADLIBRARYA)GetFunctionAddress(IsModulePresent(L"Kernel32.dll"), "LoadLibraryA");
 
     STRING aString = { 0 };
-    LDRGETPROCADDRESS pLdrGetProcAddress = NULL;
 
     pNtHeaders = RVA(
-        PIMAGE_NT_HEADERS, 
-        pdModule->pbDllData, 
+        PIMAGE_NT_HEADERS,
+        pdModule->pbDllData,
         ((PIMAGE_DOS_HEADER)pdModule->pbDllData)->e_lfanew
     );
 
     pDataDir = &pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
 
-    pLdrGetProcAddress = (LDRGETPROCADDRESS)GetProcAddress(
-        IsModulePresent(L"ntdll.dll"),
-        "LdrGetProcedureAddress"
-    );
-
-    if (!pLdrGetProcAddress)
-    {
-        return FALSE;
-    }
-
     // handle the import table
     if (pDataDir->Size)
     {
         pImportDesc = RVA(
-            PIMAGE_IMPORT_DESCRIPTOR, 
-            pdModule->ModuleBase, 
+            PIMAGE_IMPORT_DESCRIPTOR,
+            pdModule->ModuleBase,
             pDataDir->VirtualAddress
         );
 
@@ -172,7 +199,7 @@ BOOL ResolveImports(
 
         pImportDesc = RVA(
             PIMAGE_IMPORT_DESCRIPTOR,
-            pdModule->ModuleBase, 
+            pdModule->ModuleBase,
             pDataDir->VirtualAddress
         );
 
@@ -180,19 +207,25 @@ BOOL ResolveImports(
         {
             // use LoadLibraryA for the time being.
             // make this recursive in the future.
-            HMODULE hLibrary = LoadLibraryA(
-                (LPSTR)(pdModule->ModuleBase + pImportDesc->Name)
+            HMODULE hLibrary = IsModulePresentA(
+                (char*)(pdModule->ModuleBase + pImportDesc->Name)
             );
+            if (hLibrary == NULL)
+            {
+                hLibrary = pLoadLibraryA(
+                    (LPSTR)(pdModule->ModuleBase + pImportDesc->Name)
+                );
+            }
 
             pFirstThunk = RVA(
-                PIMAGE_THUNK_DATA, 
-                pdModule->ModuleBase, 
+                PIMAGE_THUNK_DATA,
+                pdModule->ModuleBase,
                 pImportDesc->FirstThunk
             );
-            
+
             pOrigFirstThunk = RVA(
-                PIMAGE_THUNK_DATA, 
-                pdModule->ModuleBase, 
+                PIMAGE_THUNK_DATA,
+                pdModule->ModuleBase,
                 pImportDesc->OriginalFirstThunk
             );
 
@@ -200,32 +233,35 @@ BOOL ResolveImports(
             {
                 if (IMAGE_SNAP_BY_ORDINAL(pOrigFirstThunk->u1.Ordinal))
                 {
-                    pLdrGetProcAddress(
-                        hLibrary, 
-                        NULL, 
-                        (WORD)pOrigFirstThunk->u1.Ordinal, 
-                        (PVOID *)&(pFirstThunk->u1.Function)
+                    ok = LocalLdrGetProcedureAddress(
+                        hLibrary,
+                        NULL,
+                        (WORD)pOrigFirstThunk->u1.Ordinal,
+                        (PVOID*)&(pFirstThunk->u1.Function)
                     );
+                    if (!ok)
+                        return FALSE;
                 }
                 else
                 {
                     pImportByName = RVA(
-                        PIMAGE_IMPORT_BY_NAME, 
-                        pdModule->ModuleBase, 
+                        PIMAGE_IMPORT_BY_NAME,
+                        pdModule->ModuleBase,
                         pOrigFirstThunk->u1.AddressOfData
                     );
-                    
+
                     FILL_STRING(
-                        aString, 
+                        aString,
                         pImportByName->Name
                     );
-
-                    pLdrGetProcAddress(
-                        hLibrary, 
-                        &aString, 
-                        0, 
-                        (PVOID *)&(pFirstThunk->u1.Function)
+                    ok = LocalLdrGetProcedureAddress(
+                        hLibrary,
+                        &aString,
+                        0,
+                        (PVOID*)&(pFirstThunk->u1.Function)
                     );
+                    if (!ok)
+                        return FALSE;
                 }
             }
         }
@@ -237,8 +273,8 @@ BOOL ResolveImports(
     if (pDataDir->Size)
     {
         pDelayDesc = RVA(
-            PIMAGE_DELAYLOAD_DESCRIPTOR, 
-            pdModule->ModuleBase, 
+            PIMAGE_DELAYLOAD_DESCRIPTOR,
+            pdModule->ModuleBase,
             pDataDir->VirtualAddress
         );
 
@@ -246,17 +282,25 @@ BOOL ResolveImports(
         {
             // use LoadLibraryA for the time being.
             // make this recursive in the future.
-            HMODULE hLibrary = LoadLibraryA((LPSTR)(pdModule->ModuleBase + pDelayDesc->DllNameRVA));
+            HMODULE hLibrary = IsModulePresentA(
+                (char*)(pdModule->ModuleBase + pDelayDesc->DllNameRVA)
+            );
+            if (hLibrary == NULL)
+            {
+                hLibrary = pLoadLibraryA(
+                    (LPSTR)(pdModule->ModuleBase + pDelayDesc->DllNameRVA)
+                );
+            }
 
             pFirstThunk = RVA(
-                PIMAGE_THUNK_DATA, 
-                pdModule->ModuleBase, 
+                PIMAGE_THUNK_DATA,
+                pdModule->ModuleBase,
                 pDelayDesc->ImportAddressTableRVA
             );
-            
+
             pOrigFirstThunk = RVA(
-                PIMAGE_THUNK_DATA, 
-                pdModule->ModuleBase, 
+                PIMAGE_THUNK_DATA,
+                pdModule->ModuleBase,
                 pDelayDesc->ImportNameTableRVA
             );
 
@@ -264,32 +308,36 @@ BOOL ResolveImports(
             {
                 if (IMAGE_SNAP_BY_ORDINAL(pOrigFirstThunk->u1.Ordinal))
                 {
-                    pLdrGetProcAddress(
-                        hLibrary, 
-                        NULL, 
-                        (WORD)pOrigFirstThunk->u1.Ordinal, 
-                        (PVOID *)&(pFirstThunk->u1.Function)
+                    ok = LocalLdrGetProcedureAddress(
+                        hLibrary,
+                        NULL,
+                        (WORD)pOrigFirstThunk->u1.Ordinal,
+                        (PVOID*)&(pFirstThunk->u1.Function)
                     );
+                    if (!ok)
+                        return FALSE;
                 }
                 else
                 {
                     pImportByName = RVA(
-                        PIMAGE_IMPORT_BY_NAME, 
-                        pdModule->ModuleBase, 
+                        PIMAGE_IMPORT_BY_NAME,
+                        pdModule->ModuleBase,
                         pOrigFirstThunk->u1.AddressOfData
                     );
-                    
+
                     FILL_STRING(
-                        aString, 
+                        aString,
                         pImportByName->Name
                     );
 
-                    pLdrGetProcAddress(
-                        hLibrary, 
-                        &aString, 
-                        0, 
-                        (PVOID *)&(pFirstThunk->u1.Function)
+                    ok = LocalLdrGetProcedureAddress(
+                        hLibrary,
+                        &aString,
+                        0,
+                        (PVOID*)&(pFirstThunk->u1.Function)
                     );
+                    if (!ok)
+                        return FALSE;
                 }
             }
         }
@@ -308,13 +356,16 @@ BOOL BeginExecution(
     PIMAGE_DATA_DIRECTORY pDataDir;
     PIMAGE_TLS_CALLBACK* ppCallback;
     PIMAGE_SECTION_HEADER pSectionHeader;
-    PIMAGE_RUNTIME_FUNCTION_ENTRY pFuncEntry;
+    //PIMAGE_RUNTIME_FUNCTION_ENTRY pFuncEntry;
+
+    VIRTUALPROTECT pVirtualProtect = (VIRTUALPROTECT)GetFunctionAddress(IsModulePresent(L"Kernel32.dll"), "VirtualProtect");
+    FLUSHINSTRUCTIONCACHE pFlushInstructionCache = (FLUSHINSTRUCTIONCACHE)GetFunctionAddress(IsModulePresent(L"Kernel32.dll"), "FlushInstructionCache");
 
     DLLMAIN DllMain = NULL;
 
     pNtHeaders = RVA(
-        PIMAGE_NT_HEADERS, 
-        pdModule->pbDllData, 
+        PIMAGE_NT_HEADERS,
+        pdModule->pbDllData,
         ((PIMAGE_DOS_HEADER)pdModule->pbDllData)->e_lfanew
     );
 
@@ -342,18 +393,33 @@ BOOL BeginExecution(
             {
                 dwProtect |= PAGE_NOCACHE;
             }
-
-            VirtualProtect(
+#if _M_X64
+            PVOID BaseAddress = (PVOID)(pdModule->ModuleBase + pSectionHeader->VirtualAddress);
+            SIZE_T RegionSize = pSectionHeader->SizeOfRawData;
+            NTSTATUS status = NtProtectVirtualMemory(
+                (HANDLE)-1,
+                &BaseAddress,
+                &RegionSize,
+                dwProtect,
+                &dwProtect
+            );
+            if (!NT_SUCCESS(status))
+            {
+                return FALSE;
+            }
+#else
+            pVirtualProtect(
                 (LPVOID)(pdModule->ModuleBase + pSectionHeader->VirtualAddress),
                 pSectionHeader->SizeOfRawData,
                 dwProtect,
                 &dwProtect
             );
+#endif
         }
     }
 
     // flush the instruction cache
-    FlushInstructionCache((HANDLE)-1, NULL, 0);
+    pFlushInstructionCache((HANDLE)-1, NULL, 0);
 
     // execute the TLS callbacks
     pDataDir = &pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
@@ -361,12 +427,12 @@ BOOL BeginExecution(
     if (pDataDir->Size)
     {
         pTlsDir = RVA(
-            PIMAGE_TLS_DIRECTORY, 
-            pdModule->ModuleBase, 
+            PIMAGE_TLS_DIRECTORY,
+            pdModule->ModuleBase,
             pDataDir->VirtualAddress
         );
 
-        ppCallback = (PIMAGE_TLS_CALLBACK *)(pTlsDir->AddressOfCallBacks);
+        ppCallback = (PIMAGE_TLS_CALLBACK*)(pTlsDir->AddressOfCallBacks);
 
         for (; *ppCallback; ppCallback++)
         {
@@ -394,6 +460,10 @@ BOOL BeginExecution(
     //     }
     // #endif
 
+    // some DLLs don't have an entry point
+    if (pNtHeaders->OptionalHeader.AddressOfEntryPoint == 0)
+        return TRUE;
+
     // call the image entry point
     DllMain = RVA(
         DLLMAIN,
@@ -401,11 +471,11 @@ BOOL BeginExecution(
         pNtHeaders->OptionalHeader.AddressOfEntryPoint
     );
 
-    DllMain(
+    BOOL ok = DllMain(
         (HINSTANCE)pdModule->ModuleBase,
         DLL_PROCESS_ATTACH,
         (LPVOID)NULL
     );
 
-    return TRUE;
+    return ok;
 }
