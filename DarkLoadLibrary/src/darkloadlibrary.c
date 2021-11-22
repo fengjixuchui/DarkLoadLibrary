@@ -1,6 +1,40 @@
 #include "darkloadlibrary.h"
 #include "ldrutils.h"
 
+SIZE_T WideStringLength(LPWSTR str)
+{
+	SIZE_T len = 0;
+	SIZE_T i = 0;
+
+	while (str[i++])
+		++len;
+
+	return len;
+}
+
+BOOL WideStringCompare(LPWSTR lpwStr1, LPWSTR lpwStr2, SIZE_T cbMaxCount)
+{
+	BOOL match = TRUE;
+
+	for (SIZE_T i = 0; i < cbMaxCount; i++)
+	{
+		WCHAR a, b;
+		a = lpwStr1[i];
+		b = lpwStr2[i];
+		if (a >= 'A' && a <= 'Z')
+			a += 32;
+		if (b >= 'A' && b <= 'Z')
+			b += 32;
+		if (a != b)
+		{
+			match = FALSE;
+			break;
+		}
+	}
+	
+	return match;
+}
+
 BOOL ParseFileName(
 	PDARKMODULE pdModule,
 	LPWSTR lpwFileName
@@ -8,9 +42,7 @@ BOOL ParseFileName(
 {
 	HEAPALLOC pHeapAlloc = (HEAPALLOC)GetFunctionAddress(IsModulePresent(L"Kernel32.dll"), "HeapAlloc");
 	GETPROCESSHEAP pGetProcessHeap = (GETPROCESSHEAP)GetFunctionAddress(IsModulePresent(L"Kernel32.dll"), "GetProcessHeap");
-	_WSPLITPATH p_wsplitpath = (_WSPLITPATH)GetFunctionAddress(IsModulePresent(L"ucrtbased.dll"), "_wsplitpath");
-	WCSCPY pwcscpy = (WCSCPY)GetFunctionAddress(IsModulePresent(L"ucrtbased.dll"), "wcscpy");
-	WCSCAT pwcscat = (WCSCAT)GetFunctionAddress(IsModulePresent(L"ucrtbased.dll"), "wcscat");
+	PATHFINDFILENAMEW pPathFindFileNameW = (PATHFINDFILENAMEW)GetFunctionAddress(IsModulePresent(L"Shlwapi.dll"), "PathFindFileNameW");
 
 	if (lpwFileName == NULL)
 	{
@@ -33,53 +65,21 @@ BOOL ParseFileName(
 		MAX_PATH * 2
 	);
 
-	PWCHAR lpwExt = (PWCHAR)pHeapAlloc(
-		hHeap,
-		HEAP_ZERO_MEMORY,
-		MAX_PATH
-	);
-
-	PWCHAR lpwFilename = (PWCHAR)pHeapAlloc(
-		hHeap,
-		HEAP_ZERO_MEMORY,
-		MAX_PATH
-	);
-
-	if (!pdModule->CrackedDLLName || !lpwExt || !lpwFilename)
+	if (!pdModule->CrackedDLLName)
 	{
 		pdModule->ErrorMsg = L"Failed to allocate memory";
 		return FALSE;
 	}
 
-	p_wsplitpath(
-        lpwFileName,
-        NULL,
-        NULL,
-        lpwFilename,
-        lpwExt
-    );
+	LPWSTR lpwFileNameLocation = pPathFindFileNameW(lpwFileName);
 
-	if (lpwFilename == NULL || lpwExt == NULL)
-	{
-		pdModule->ErrorMsg = L"Failed to crack filename";
-		return FALSE;
-	}
-
-	PCHAR lpCpy = (PCHAR)pwcscpy(
-		pdModule->CrackedDLLName,
-		lpwFilename
-	);
-    
-	PCHAR lpCat = (PCHAR)pwcscat(
-		pdModule->CrackedDLLName,
-		lpwExt
-	);
-
-	if (!lpCpy || !lpCat)
-	{
-		pdModule->ErrorMsg = L"Failed to format cracked path";
-		return FALSE;
-	}
+	/*
+		Copy the length of the filename modulo sizeof pdModule->CrackedDLLName - 1 for null byte.
+		
+		TODO:
+		Get a working wstrcpy implementation
+	*/
+	memcpy(pdModule->CrackedDLLName, lpwFileNameLocation, (WideStringLength(lpwFileNameLocation) % (MAX_PATH - 1)) * 2);
 
 	return TRUE;
 }
@@ -119,6 +119,7 @@ BOOL ReadFileToBuffer(
 	if (dwSize == INVALID_FILE_SIZE)
     {
         pdModule->ErrorMsg = L"Failed to get DLL file size";
+        pCloseHandle(hFile);
 		return FALSE;
     }
 
@@ -132,6 +133,7 @@ BOOL ReadFileToBuffer(
 	if (pdModule->pbDllData == NULL)
 	{
 		pdModule->ErrorMsg = L"Failed to allocate memory for DLL data";
+		pCloseHandle(hFile);
 		return FALSE;
 	}
 
@@ -143,6 +145,9 @@ BOOL ReadFileToBuffer(
         NULL))
     {
         pdModule->ErrorMsg = L"Failed to read data from DLL file";
+        pCloseHandle(hFile);
+	// TODO: need to Free buffer on error: e.g. pVirtualFree(pdModule->pbDllData);
+	
 		return FALSE;
     }
 
@@ -165,7 +170,16 @@ PDARKMODULE DarkLoadLibrary(
 {
 	HEAPALLOC pHeapAlloc = (HEAPALLOC)GetFunctionAddress(IsModulePresent(L"Kernel32.dll"), "HeapAlloc");
 	GETPROCESSHEAP pGetProcessHeap = (GETPROCESSHEAP)GetFunctionAddress(IsModulePresent(L"Kernel32.dll"), "GetProcessHeap");
-	WCSCAT pwcscat = (WCSCAT)GetFunctionAddress(IsModulePresent(L"ucrtbased.dll"), "wcscat");
+
+	/*
+		TODO:
+		I would really love to stop using error messages that need this.
+		All the other safe versions of wsprintfW are located in the CRT,
+			which is an issue if there is no CRT in the process.
+
+		For now let us hope nobody will pass a name larger than 500 bytes. :/
+	*/
+	WSPRINTFW pwsprintfW = (WSPRINTFW)GetFunctionAddress(IsModulePresent(L"User32.dll"), "wsprintfW");
 
 	PDARKMODULE dModule = (DARKMODULE*)pHeapAlloc(pGetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(DARKMODULE));
 	if (!dModule)
@@ -212,9 +226,7 @@ PDARKMODULE DarkLoadLibrary(
 		lpwName = dModule->CrackedDLLName;
 	}
 
-	HMODULE hModule = IsModulePresent(
-		lpwName
-	);
+	HMODULE hModule = IsModulePresent(lpwName);
 
 	if (hModule != NULL)
 	{
@@ -231,8 +243,7 @@ PDARKMODULE DarkLoadLibrary(
 		if (!dModule->ErrorMsg)
 			goto Cleanup;
 
-		pwcscat(dModule->ErrorMsg, L"Data is an invalid PE: ");
-		pwcscat(dModule->ErrorMsg, lpwName);
+		pwsprintfW(dModule->ErrorMsg, TEXT("Data is an invalid PE: %s"), lpwName);
 		goto Cleanup;
 	}
 
@@ -243,8 +254,7 @@ PDARKMODULE DarkLoadLibrary(
 		if (!dModule->ErrorMsg)
 			goto Cleanup;
 
-		pwcscat(dModule->ErrorMsg, L"Failed to map sections: ");
-		pwcscat(dModule->ErrorMsg, lpwName);
+		pwsprintfW(dModule->ErrorMsg, TEXT("Failed to map sections: %s"), lpwName);
 		goto Cleanup;
 	}
 
@@ -255,8 +265,7 @@ PDARKMODULE DarkLoadLibrary(
 		if (!dModule->ErrorMsg)
 			goto Cleanup;
 
-		pwcscat(dModule->ErrorMsg, L"Failed to resolve imports: ");
-		pwcscat(dModule->ErrorMsg, lpwName);
+		pwsprintfW(dModule->ErrorMsg, TEXT("Failed to resolve imports: %s"), lpwName);
 		goto Cleanup;
 	}
 
@@ -269,8 +278,7 @@ PDARKMODULE DarkLoadLibrary(
 			if (!dModule->ErrorMsg)
 				goto Cleanup;
 			
-			pwcscat(dModule->ErrorMsg, L"Failed to link module to PEB: ");
-			pwcscat(dModule->ErrorMsg, lpwName);
+			pwsprintfW(dModule->ErrorMsg, TEXT("Failed to link module to PEB: %s"), lpwName);
 			goto Cleanup;
 		}
 	}
@@ -282,8 +290,7 @@ PDARKMODULE DarkLoadLibrary(
 		if (!dModule->ErrorMsg)
 			goto Cleanup;
 
-		pwcscat(dModule->ErrorMsg, L"Failed to execute: ");
-		pwcscat(dModule->ErrorMsg, lpwName);
+		pwsprintfW(dModule->ErrorMsg, TEXT("Failed to execute: %s"), lpwName);
 		goto Cleanup;
 	}
 
